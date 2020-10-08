@@ -1,0 +1,69 @@
+#!/bin/sh
+set -e
+
+INCLUDES=`dirname "$0"`
+
+# set 'PASS' environment variable for this script
+# CA key will remain encrypted, while the generated cert will have no password
+
+die() {
+    echo "$1"
+    usage
+    exit 1
+}
+
+genca() {
+    CONSTRAINT=$1
+    SUBJ="${2:-/C=US/O=$1 Internal CA/OU=CA}"
+    [ -z $CONSTRAINT ] && die "need constraint arg"
+    [ -z $CA_PASS ] && die "CA_PASS is required to read CA certificate"
+    echo '1000' > ca.srl
+    openssl genrsa -passout pass:$CA_PASS -aes256 -out ca.key.pem 4096
+    openssl req -passin pass:$CA_PASS -nodes -new -key ca.key.pem -extensions v3_ca -batch -out ca.csr -utf8 -subj "$SUBJ"
+
+    # Generates restricted CA (by CONSTRAINT host)
+    CONSTRAINT="$CONSTRAINT" openssl x509 -req -passin pass:$CA_PASS -sha256 -days 3650 -in ca.csr -signkey ca.key.pem -extfile $INCLUDES/caext.ini -out ca.crt
+}
+
+gencert() {
+    SAN="$1"
+    OUT="${2:-out}"
+    [ -z $CA_PASS ] && die "CA_PASS is required to read CA certificate"
+    # CERT_PASS will be removed from result decrypted certificate
+    export CERT_PASS=unused_pass
+    openssl genrsa -passout pass:$CERT_PASS -aes256 -out $OUT.key.pem 2048
+    openssl req -passin pass:$CERT_PASS --new -key $OUT.key.pem -extensions v3_ca -batch -out $OUT.csr -utf8 -subj "/CN=$SAN"
+    CERT_SAN=DNS:$SAN openssl x509 -req -passin pass:$CA_PASS -sha256 -days 3650 -in $OUT.csr -CAkey ca.key.pem -CA ca.crt -out $OUT.crt -extfile $INCLUDES/certext.ini
+
+    # remove password from certificate key
+    openssl rsa -passin pass:$CERT_PASS -in $OUT.key.pem -out $OUT.key.pem.decrypted
+    mv $OUT.key.pem.decrypted $OUT.key.pem 
+
+    openssl verify -CAfile ca.crt $OUT.crt
+    cat $OUT.crt ca.crt  > $OUT.fullchain.pem
+    echo "Parts: ca.crt $OUT.crt $OUT.key.pem"
+    echo "Certificate Bundle: $OUT.fullchain.pem $OUT.key.pem"
+}
+
+showca() {
+    openssl x509 -in ca.crt -noout -text | grep Issuer -C5
+    openssl x509 -in ca.crt -noout -text | grep X509 -A3
+}
+
+usage() {
+cat <<END
+    export CA_PASS=<CA PASS>
+    $0 genca <restricted_domain> -- generates new restricted CA(encrypted)
+    $0 gencert <domain> -- generates and verifies certificate for domain
+END
+
+if [ -z $CA_PASS ]; then
+    echo "CA_PASS environment variable not set!"
+fi
+exit 1
+}
+
+
+# run func
+${1:-usage} "$2" "$3" "$4" "$5" || usage
+
